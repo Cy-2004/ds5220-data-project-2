@@ -5,7 +5,6 @@ from datetime import datetime, timezone
 
 import boto3
 import duckdb
-from botocore.exceptions import ClientError
 import matplotlib
 import matplotlib.pyplot as plt
 import pandas as pd
@@ -25,18 +24,19 @@ log = logging.getLogger(__name__)
 API_KEY    = os.environ["EIA_API_KEY"]
 RESPONDENT = os.environ.get("EIA_RESPONDENT", "PJM")
 S3_BUCKET  = os.environ["S3_BUCKET"]
+S3_REGION  = os.environ.get("S3_REGION", "us-east-1")
 
-EIA_URL       = "https://api.eia.gov/v2/electricity/rto/fuel-type-data/data/"
-PARQUET_KEY   = "data.parquet"
-PARQUET_LOCAL = "/tmp/data.parquet"
+EIA_URL     = "https://api.eia.gov/v2/electricity/rto/fuel-type-data/data/"
+PARQUET_KEY = "data.parquet"
+PARQUET_S3  = f"s3://{S3_BUCKET}/{PARQUET_KEY}"   # resolved once at startup
 
 # Stacking order for the area chart: base-load sources on the bottom,
 # variable renewables on top.
 FUEL_ORDER = ["NUC", "COL", "NG", "OIL", "WAT", "WND", "SUN", "GEO", "BIO", "OTH"]
 FUEL_LABELS = {
-    "NUC": "Nuclear",   "COL": "Coal",      "NG":  "Natural Gas",
-    "OIL": "Oil",       "WAT": "Hydro",     "WND": "Wind",
-    "SUN": "Solar",     "GEO": "Geothermal","BIO": "Biomass",
+    "NUC": "Nuclear",   "COL": "Coal",       "NG":  "Natural Gas",
+    "OIL": "Oil",       "WAT": "Hydro",      "WND": "Wind",
+    "SUN": "Solar",     "GEO": "Geothermal", "BIO": "Biomass",
     "OTH": "Other",
 }
 FUEL_COLORS = {
@@ -45,6 +45,27 @@ FUEL_COLORS = {
     "SUN": "#FFD700",  "GEO": "#CD853F",  "BIO": "#6B8E23",
     "OTH": "#AAAAAA",
 }
+
+
+# ---------------------------------------------------------------------------
+# DuckDB setup — called once; returns a connection with httpfs loaded and
+# S3 configured to use the EC2 instance profile (no credentials needed).
+# ---------------------------------------------------------------------------
+def setup_duckdb() -> duckdb.DuckDBPyConnection:
+    con = duckdb.connect()
+    con.execute("INSTALL httpfs; LOAD httpfs;")
+    # CREDENTIAL_CHAIN walks the standard AWS chain: env vars → ~/.aws/credentials
+    # → EC2 instance metadata. On EC2 with an IAM role attached this picks up the
+    # instance profile automatically — no keys or credentials file needed.
+    con.execute(f"""
+        CREATE SECRET s3_creds (
+            TYPE S3,
+            PROVIDER CREDENTIAL_CHAIN,
+            REGION '{S3_REGION}'
+        )
+    """)
+    log.info("DuckDB httpfs ready (region=%s, provider=credential_chain)", S3_REGION)
+    return con
 
 
 # ---------------------------------------------------------------------------
@@ -67,7 +88,7 @@ def fetch_eia() -> tuple[str, list[dict]]:
     resp.raise_for_status()
     rows = resp.json()["response"]["data"]
     if not rows:
-        raise ValueError("EIA API returned an empty dataset — check your respondent code and API key")
+        raise ValueError("EIA API returned an empty dataset — check respondent code and API key")
 
     # The API returns N most-recent records across possibly multiple periods.
     # Isolate only records belonging to the single most-recent period.
@@ -80,18 +101,14 @@ def fetch_eia() -> tuple[str, list[dict]]:
 # ---------------------------------------------------------------------------
 # Step 2 — Load history from S3 into DuckDB and append new records
 # ---------------------------------------------------------------------------
-def load_and_store(period: str, rows: list[dict]) -> duckdb.DuckDBPyConnection:
-    """Download the accumulation Parquet from S3 (if it exists), load it into
-    an in-memory DuckDB table, then insert the new hour's records.
-    Returns the open connection for querying and export.
+def load_and_store(con: duckdb.DuckDBPyConnection, period: str, rows: list[dict]) -> None:
+    """Read the accumulation Parquet directly from S3 via httpfs (no local
+    download), then insert the new hour's records.
 
-    DuckDB is in-memory here because the CronJob pod is ephemeral — S3 is the
-    durable store. On each run we pull the full history down, append one hour,
-    and push it back. A PRIMARY KEY on (period, fueltype) prevents duplicates
-    if the job ever fires twice in the same hour.
+    A PRIMARY KEY on (period, fueltype) prevents duplicates if the job ever
+    fires twice in the same hour. The Parquet file in S3 is the durable store —
+    DuckDB is in-memory because the CronJob pod is ephemeral.
     """
-    con = duckdb.connect()
-
     con.execute("""
         CREATE TABLE readings (
             period     TIMESTAMP,
@@ -103,23 +120,17 @@ def load_and_store(period: str, rows: list[dict]) -> duckdb.DuckDBPyConnection:
         )
     """)
 
-    # Pull existing history from S3.
-    s3 = boto3.client("s3")
+    # Stream the existing Parquet directly from S3 — no temp file needed.
+    # On the first ever run the file won't exist; catch that and start fresh.
     try:
-        obj = s3.get_object(Bucket=S3_BUCKET, Key=PARQUET_KEY)
-        with open(PARQUET_LOCAL, "wb") as fh:
-            fh.write(obj["Body"].read())
-        con.execute(f"INSERT INTO readings SELECT * FROM read_parquet('{PARQUET_LOCAL}')")
+        con.execute(f"INSERT INTO readings SELECT * FROM read_parquet('{PARQUET_S3}')")
         existing = con.execute("SELECT COUNT(*) FROM readings").fetchone()[0]
-        log.info("Loaded %d existing records from s3://%s/%s", existing, S3_BUCKET, PARQUET_KEY)
-    except ClientError as exc:
-        if exc.response["Error"]["Code"] not in ("NoSuchKey", "404"):
-            raise
-        log.info("No existing parquet in S3 — starting fresh")
+        log.info("Loaded %d existing records from %s", existing, PARQUET_S3)
+    except duckdb.Error:
+        log.info("No existing parquet at %s — starting fresh", PARQUET_S3)
 
-    # Insert new records; ON CONFLICT DO NOTHING skips any period already stored.
-    # EIA periods arrive as "2026-03-31T03" (hour only). Parse them to datetime
-    # objects so DuckDB doesn't have to handle the non-standard string format.
+    # EIA periods arrive as "2026-03-31T03" (hour only). Parse to datetime so
+    # DuckDB doesn't have to handle the non-standard string format.
     fetched_at = datetime.now(timezone.utc)
     new_rows = [
         (
@@ -139,7 +150,6 @@ def load_and_store(period: str, rows: list[dict]) -> duckdb.DuckDBPyConnection:
     total   = con.execute("SELECT COUNT(*) FROM readings").fetchone()[0]
     periods = con.execute("SELECT COUNT(DISTINCT period) FROM readings").fetchone()[0]
     log.info("DuckDB: %d records across %d hourly periods", total, periods)
-    return con
 
 
 # ---------------------------------------------------------------------------
@@ -209,19 +219,16 @@ def generate_plot(df: pd.DataFrame) -> io.BytesIO:
 
 
 # ---------------------------------------------------------------------------
-# Step 5 — Export Parquet + CSV from DuckDB and upload everything to S3
+# Step 5 — Write Parquet back to S3 via httpfs; upload CSV and plot via boto3
 # ---------------------------------------------------------------------------
 def push_s3(con: duckdb.DuckDBPyConnection, df: pd.DataFrame, plot_buf: io.BytesIO) -> None:
-    s3 = boto3.client("s3")
+    # Parquet: written directly to S3 by DuckDB — no local file, no boto3.
+    con.execute(f"COPY readings TO '{PARQUET_S3}' (FORMAT PARQUET)")
+    log.info("Wrote %s via httpfs", PARQUET_S3)
 
-    # Parquet is the durable accumulation store — overwrite it with the full table.
-    con.execute(f"COPY readings TO '{PARQUET_LOCAL}' (FORMAT PARQUET)")
-    with open(PARQUET_LOCAL, "rb") as fh:
-        s3.put_object(Bucket=S3_BUCKET, Key=PARQUET_KEY, Body=fh.read(),
-                      ContentType="application/octet-stream")
-    log.info("Uploaded %s to s3://%s", PARQUET_KEY, S3_BUCKET)
+    # CSV and plot are not Parquet so boto3 is the right tool for those.
+    s3 = boto3.client("s3", region_name=S3_REGION)
 
-    # CSV for human-readable download.
     csv_bytes = df.reset_index().to_csv(index=False).encode()
     s3.put_object(Bucket=S3_BUCKET, Key="data.csv", Body=csv_bytes, ContentType="text/csv")
     log.info("Uploaded data.csv (%d bytes) to s3://%s", len(csv_bytes), S3_BUCKET)
@@ -236,7 +243,8 @@ def push_s3(con: duckdb.DuckDBPyConnection, df: pd.DataFrame, plot_buf: io.Bytes
 def main():
     log.info("=== Pipeline starting | respondent=%s | bucket=%s ===", RESPONDENT, S3_BUCKET)
     period, rows = fetch_eia()
-    con          = load_and_store(period, rows)
+    con          = setup_duckdb()
+    load_and_store(con, period, rows)
     df           = build_dataframe(con)
     plot_buf     = generate_plot(df)
     push_s3(con, df, plot_buf)

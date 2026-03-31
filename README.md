@@ -218,7 +218,7 @@ Submit the following in the Canvas assignment:
 
 In addition to the above requirements:
 
-4. **Submit your answers to the following questions** in a markdown or PDF file uploaded to Canvas. Do not consult generative AI for these answers.
+1. **Submit answers to the following questions** in a markdown or PDF file uploaded to Canvas. Do not consult generative AI for these answers.
 
     - In the sample data application above, data persists outside of the pods through the use of S3. If this were a higher-frequency application (hundreds of times per minute) how might you persist the data in a more performant way? (One paragraph)
     - How do your CronJob pods gain permission to read/write to Amazon S3? How does this differ from running a container locally using Docker? (One paragraph)

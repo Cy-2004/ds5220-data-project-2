@@ -5,7 +5,6 @@ metadata:
   namespace: default
 spec:
   schedule: "0 * * * *"       # runs at the top of every hour
-  concurrencyPolicy: Forbid   # skip a run if the previous one is still going
   successfulJobsHistoryLimit: 10
   failedJobsHistoryLimit: 10
   jobTemplate:
@@ -35,4 +34,8 @@ spec:
                 # TODO: replace with your S3 bucket name
                 - name: S3_BUCKET
                   value: "your-bucket-name"
+
+                # AWS region for the S3 bucket — used by both boto3 and DuckDB httpfs
+                - name: S3_REGION
+                  value: "us-east-1"
 
