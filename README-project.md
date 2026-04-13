@@ -17,7 +17,7 @@ This process repeats automatically, allowing the dataset and visualization to co
 
 3. Output Data and Plot
 
-plot.png: A line chart showing water level over time. This plot updates with each run and shows the most recent data collected.
+plot.png: A line chart showing water level over time. This plot updates with each run and shows all the data collected.
 
 data.csv: A dataset containing all recorded observations, including timestamp and water level. This file updates with each run and grows over time. 
 
