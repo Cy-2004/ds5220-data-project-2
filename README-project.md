@@ -29,9 +29,9 @@ I used the U.S. Geological Survey water services API. I chose it because it upda
 
 2. What you observe in the data
 
-The water level stays mostly stable with small changes. There are slight increases and decreases over time, but no extreme spikes. This makes sense because river levels usually change gradually unless there is heavy rainfall or flooding. 
+The water level continuously decreases over time. There is a very slight increase at the start, but afterwards it keeps gradually decreasing.
 
-3. Kubernetes Secrets vs environment variables
+1. Kubernetes Secrets vs environment variables
 
 Kubernetes Secrets are used to store sensitive information like API keys, while plain environment variables are just normal values stored in the container. Kubernetes Secrets are secure and hidden, while environment variables are visible in configuration files. This matters because putting sensitive data directly in YAML files or Docker images is unsafe. Kubernetes Secrets keep that information protected.
 
