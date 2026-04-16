@@ -29,7 +29,7 @@ I used the U.S. Geological Survey water services API. I chose it because it upda
 
 2. What you observe in the data
 
-The water level continuously decreases over time. There is a very slight increase at the start, but afterwards it keeps gradually decreasing.
+The water level keeps increasing and decreasing over time. However, the peaks have slightly decreased over time.
 
 1. Kubernetes Secrets vs environment variables
 
